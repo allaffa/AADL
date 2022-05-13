@@ -50,7 +50,7 @@ def anderson_qr_factorization_redcued(X, relaxation=1.0, regularization = 0.0, r
 
     if regularization == 0.0:
        # solve unconstrained least-squares problem
-       if reduction_type is "maximum":
+       if reduction_type == "maximum":
           num_entries_kept = int(DX.shape[0] * reduction_ratio)
           indices = torch.topk(DX[:, -1], num_entries_kept)
           gamma = torch.linalg.lstsq(DR[indices, :], DX[indices, -1]).solution
