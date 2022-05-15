@@ -85,6 +85,8 @@ def distributed_accelerated_step(self, closure=None):
                     acc_param = anderson.anderson_qr_factorization(X, self.acc_relaxation, self.acc_reg)
                 elif self.acc_type == 'anderson_normal_equation':
                     acc_param = anderson.anderson_normal_equation(X, self.acc_relaxation, self.acc_reg)
+                elif self.acc_type == "anderson_reduced":
+                    acc_param = anderson.anderson_qr_factorization_reduced(X, self.acc_relaxation, self.acc_reg)
 
                 # sync accelerated params across the nodes
                 if _world_size>1:
@@ -185,7 +187,9 @@ def averaged_accelerated_step(self, closure=None):
                 if self.acc_type == 'anderson':
                     acc_param = anderson.anderson_qr_factorization(X, self.acc_relaxation, self.acc_reg) 
                 elif self.acc_type == 'anderson_normal_equation':
-                    acc_param = anderson.anderson_normal_equation(X, self.acc_relaxation, self.acc_reg)                    
+                    acc_param = anderson.anderson_normal_equation(X, self.acc_relaxation, self.acc_reg)
+                elif self.acc_type == "anderson_reduced":
+                    acc_param = anderson.anderson_qr_factorization_reduced(X, self.acc_relaxation, self.acc_reg)
 
                 # loss after non-accelerated optimizer
                 if closure is not None:

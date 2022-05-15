@@ -36,7 +36,7 @@ def anderson_qr_factorization(X, relaxation=1.0, regularization = 0.0):
 
     return extr
 
-def anderson_qr_factorization_redcued(X, relaxation=1.0, regularization = 0.0, reduction_type="maximum", reduction_ratio=0.5):
+def anderson_qr_factorization_reduced(X, relaxation=1.0, regularization = 0.0, reduction_type="maximum", reduction_ratio=0.1):
     # Anderson Acceleration
     # Take a matrix X of iterates such that X[:,i] = g(X[:,i-1])
     # Return acceleration for X[:,-1]
@@ -52,7 +52,7 @@ def anderson_qr_factorization_redcued(X, relaxation=1.0, regularization = 0.0, r
        # solve unconstrained least-squares problem
        if reduction_type == "maximum":
           num_entries_kept = int(DX.shape[0] * reduction_ratio)
-          indices = torch.topk(DX[:, -1], num_entries_kept)
+          indices = torch.topk(DX[:, -1], num_entries_kept).indices
           gamma = torch.linalg.lstsq(DR[indices, :], DX[indices, -1]).solution
        else:
           raise ValueError("reduction type NOT recognized: ")
