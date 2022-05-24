@@ -80,7 +80,9 @@ def anderson_qr_factorization_reduced(X, relaxation=1.0, regularization = 0.0, r
        elif reduction_type == "random":
           num_entries_kept = int(DX.shape[0] * reduction_ratio)
           start = time.perf_counter()
-          indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
+          #indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
+          indices = list(range(0, int(DX.shape[0])))
+          indices = random.choices(indices, k=num_entries_kept)
           finish = time.perf_counter()
           restricted_residual = torch.zeros(DX.shape[0],)
           restricted_residual[indices] = DX[indices, -1]
@@ -89,19 +91,20 @@ def anderson_qr_factorization_reduced(X, relaxation=1.0, regularization = 0.0, r
               if reduction_ratio > max_ratio:
                  reduction_ratio = max_ratio
                  break
-              num_entries_kept = int(DX.shape[0] * reduction_ratio)
-              indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
+              #indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
+              indices = list(range(0, int(DX.shape[0])))
+              indices = random.choices(indices, k=num_entries_kept)
               finish = time.perf_counter()
               restricted_residual = torch.zeros(DX.shape[0],)
               restricted_residual[indices] = DX[indices, -1]
-          print("Time for generation of random numbers: ", finish-start)
+          #print("Time for generation of random numbers: ", finish-start)
        else:
           raise ValueError("reduction type NOT recognized: ")
 
        start = time.perf_counter()
        gamma = torch.linalg.lstsq(DR[indices, :], DX[indices, -1]).solution
        finish = time.perf_counter()
-       print("Time to solve the least-squares: ", finish - start)
+       #print("Time to solve the least-squares: ", finish - start)
     else:
        # solve augmented least-squares for Tykhonov regularization
        rhs = DX[:,-1]
