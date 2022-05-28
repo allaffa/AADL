@@ -65,44 +65,39 @@ def anderson_qr_factorization_reduced(X, relaxation=1.0, regularization = 0.0, r
        # solve unconstrained least-squares problem
        if reduction_type == "maximum":
           num_entries_kept = int(DX.shape[0] * reduction_ratio)
-          indices = torch.topk(DX[:, -1], num_entries_kept).indices
+          start = time.perf_counter()
+          indices = torch.topk(DX[:, -1], int(DX.shape[0] * max_ratio)).indices
           restricted_residual = torch.zeros(DX.shape[0],)
-          restricted_residual[indices] = DX[indices, -1]
+          restricted_residual[indices[:num_entries_kept]] = DX[indices[:num_entries_kept], -1]
           while torch.norm(DX[:, -1]-restricted_residual) > (1/200*(torch.norm(DX[:, -1])**2) * 1e-8):
               reduction_ratio = reduction_ratio * 2
               if reduction_ratio > max_ratio:
                  reduction_ratio = max_ratio
                  break
               num_entries_kept = int(DX.shape[0] * reduction_ratio)
-              indices = torch.topk(DX[:, -1], num_entries_kept).indices
-              restricted_residual = torch.zeros(DX.shape[0],)
-              restricted_residual[indices] = DX[indices, -1]
+              restricted_residual[indices[:num_entries_kept]] = DX[indices[:num_entries_kept], -1]
+          finish = time.perf_counter()
+          #print("Time for sorting: ", finish-start)
        elif reduction_type == "random":
           num_entries_kept = int(DX.shape[0] * reduction_ratio)
           start = time.perf_counter()
-          #indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
-          indices = list(range(0, int(DX.shape[0])))
-          indices = random.choices(indices, k=num_entries_kept)
-          finish = time.perf_counter()
+          indices = torch.randperm(int(DX.shape[0]))[:int(DX.shape[0] * max_ratio)]
           restricted_residual = torch.zeros(DX.shape[0],)
-          restricted_residual[indices] = DX[indices, -1]
+          restricted_residual[indices[:num_entries_kept]] = DX[indices[:num_entries_kept], -1]
           while torch.norm(DX[:, -1]-restricted_residual) > (1/200*(torch.norm(DX[:, -1])**2) * 1e-8):
               reduction_ratio = reduction_ratio * 2
               if reduction_ratio > max_ratio:
                  reduction_ratio = max_ratio
                  break
-              #indices = random.sample(range(0, int(DX.shape[0])), num_entries_kept)
-              indices = list(range(0, int(DX.shape[0])))
-              indices = random.choices(indices, k=num_entries_kept)
-              finish = time.perf_counter()
-              restricted_residual = torch.zeros(DX.shape[0],)
-              restricted_residual[indices] = DX[indices, -1]
+              num_entries_kept = int(DX.shape[0] * reduction_ratio)
+              restricted_residual[indices[:num_entries_kept]] = DX[indices[:num_entries_kept], -1]
+          finish = time.perf_counter()
           #print("Time for generation of random numbers: ", finish-start)
        else:
           raise ValueError("reduction type NOT recognized: ")
 
        start = time.perf_counter()
-       gamma = torch.linalg.lstsq(DR[indices, :], DX[indices, -1]).solution
+       gamma = torch.linalg.lstsq(DR[indices[:num_entries_kept], :], DX[indices[:num_entries_kept], -1]).solution
        finish = time.perf_counter()
        #print("Time to solve the least-squares: ", finish - start)
     else:
