@@ -168,6 +168,10 @@ only the initial sketched attempt. Ordered stratified samples avoid the
 full-size permutation and reduce non-contiguous memory access, but the best
 fraction remains model- and hardware-dependent.
 
+See [Anderson sketching](docs/sketching.md) for the decision sequence,
+mathematical criteria, policy comparison, distributed semantics, and tuning
+guidance.
+
 The backward-error policy remembers the fraction that last passed its
 algebraic and loss checks. Rejections move the remembered starting point up;
 after several first-attempt successes, hysteresis lowers it by one growth step.

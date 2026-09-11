@@ -641,6 +641,39 @@ class TestAccelerateAPI(unittest.TestCase):
         self.assertEqual(solved_rows, [2, 4])
         self.assertEqual(opt.acc_last_sketch_fraction, 0.5)
 
+    def test_backward_error_policy_with_real_kernel(self):
+        # Equal-curvature coordinates produce the same fixed-point trajectory,
+        # so a stratified subset contains sufficient information for the real
+        # QR kernel to extrapolate the complete parameter vector.
+        parameter = torch.nn.Parameter(torch.full((8,), 2.0))
+        opt = torch.optim.SGD([parameter], lr=0.1)
+        accelerate(
+            opt, acceleration_type="anderson", relaxation=1.0,
+            wait_iterations=0, history_depth=4, frequency=1,
+            reg_acc=1e-6, sketch_fraction=0.25,
+            sketch_policy="backward_error", sketch_growth_factor=2.0,
+            sketch_max_fraction=1.0, sketch_energy_tolerance=1.0,
+            sketch_condition_limit=1e8,
+        )
+
+        def closure():
+            loss = parameter.square().sum()
+            if torch.is_grad_enabled():
+                opt.zero_grad()
+                loss.backward()
+            return loss
+
+        opt.step(closure)
+        opt.step(closure)
+        with torch.no_grad():
+            plain_loss_before_acceleration = float(closure())
+        returned_loss = opt.step(closure)
+
+        self.assertTrue(torch.isfinite(parameter).all())
+        self.assertLess(float(returned_loss), plain_loss_before_acceleration)
+        self.assertEqual(opt.acc_last_sketch_fraction, 0.25)
+        self.assertEqual(opt.acc_current_sketch_fraction, 0.25)
+
     def test_safeguard_closures_are_loss_only(self):
         parameter = torch.nn.Parameter(torch.full((8,), 2.0))
         opt = torch.optim.SGD([parameter], lr=0.1)
