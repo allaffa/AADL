@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -138,6 +140,18 @@ def _iterative_refine(y, DR_high, b_high, scale_high, reg, steps, correction_sol
     return y
 
 
+def _factor_condition(R):
+    """Condition estimate from an already-computed small square factor."""
+    if R.numel() == 0:
+        return float("inf")
+    # Keep float32/float64 on the active backend (notably, MPS does not support
+    # float64). Only promote low-precision factors to the broadly supported
+    # float32 diagnostic path.
+    dtype = R.dtype if R.dtype in (torch.float32, torch.float64) else torch.float32
+    value = torch.linalg.cond(R.detach().to(dtype=dtype))
+    return float(value) if torch.isfinite(value) else float("inf")
+
+
 
 def _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation):
     """Assemble the Anderson extrapolation from a mixing vector ``gamma``.
@@ -153,7 +167,8 @@ def _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation):
 
 def anderson_qr_factorization(X, relaxation=1.0, regularization=0.0, dtype=None,
                               equilibrate=True, filter_condition=0.0,
-                              refinement_steps=0, row_indices=None):
+                              refinement_steps=0, row_indices=None,
+                              return_diagnostics=False):
     # Anderson Acceleration
     # Take a matrix X of iterates such that X[:,i] = g(X[:,i-1])
     # Return acceleration for X[:,-1]
@@ -232,12 +247,16 @@ def anderson_qr_factorization(X, relaxation=1.0, regularization=0.0, dtype=None,
     else:
         gamma = (y / scale).to(orig_dtype)
 
-    return _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation)
+    result = _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation)
+    if return_diagnostics:
+        return result, {"condition": _factor_condition(R)}
+    return result
 
 
 def anderson_normal_equation(X, relaxation=1.0, regularization=0.0, dtype=None,
                              equilibrate=True, filter_condition=0.0,
-                             refinement_steps=0, row_indices=None):
+                             refinement_steps=0, row_indices=None,
+                             return_diagnostics=False):
     # Anderson Acceleration via the normal equations
     # Take a matrix X of iterates such that X[:,i] = g(X[:,i-1])
     # Return acceleration for X[:,-1]
@@ -312,7 +331,15 @@ def anderson_normal_equation(X, relaxation=1.0, regularization=0.0, dtype=None,
     else:
         gamma = (y / scale).to(orig_dtype)
 
-    return _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation)
+    result = _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation)
+    if return_diagnostics:
+        # cond(A)^2 = cond(A^T A); take the square root to report the
+        # condition of the least-squares matrix consistently with the QR path.
+        rr_condition = _factor_condition(RR)
+        condition = (math.sqrt(rr_condition)
+                     if math.isfinite(rr_condition) else float("inf"))
+        return result, {"condition": condition}
+    return result
 
 
 _ACCELERATIONS = {

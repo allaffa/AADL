@@ -95,6 +95,14 @@ class AndersonKernelTests(unittest.TestCase):
             actual = kernel(X, row_indices=rows)
             self.assertTrue(torch.allclose(actual, expected, atol=1e-12))
 
+    def test_kernel_diagnostics_report_finite_condition(self):
+        X = _richardson_history(self.A, self.b, self.x0, self.omega, n_iters=6)
+        for kernel in (anderson_qr_factorization, anderson_normal_equation):
+            actual, diagnostics = kernel(X, return_diagnostics=True)
+            self.assertEqual(actual.shape, X[:, -1].shape)
+            self.assertTrue(math.isfinite(diagnostics["condition"]))
+            self.assertGreaterEqual(diagnostics["condition"], 1.0)
+
     def test_reduced_row_sketch_returns_full_finite_iterate(self):
         X = _richardson_history(self.A, self.b, self.x0, self.omega, n_iters=6)
         rows = torch.tensor([0, 2, 4, 6], dtype=torch.long)

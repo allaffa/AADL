@@ -99,8 +99,10 @@ AADL.accelerate(
     reg_acc=1e-8,
     safeguard=True,
     sketch_fraction=0.1,
-    sketch_policy="adaptive",
+    sketch_policy="backward_error",
     sketch_max_fraction=1.0,
+    sketch_energy_tolerance=0.1,
+    sketch_condition_limit=1e8,
 )
 
 def closure():
@@ -147,8 +149,17 @@ loss = optimizer.step(closure)
   parameter group; `1.0` (the default) preserves the full solve.
 - `sketch_policy`: `"fixed"` uses one sketch. `"adaptive"` retries a rejected
   safeguarded candidate with a larger sketch until `sketch_max_fraction`.
+  `"backward_error"` automatically grows the sketch until both its omitted
+  update energy and least-squares condition estimate satisfy their limits.
 - `sketch_growth_factor`: coordinate-count multiplier for adaptive retries.
 - `sketch_seed`: seed for reproducible coordinate sampling.
+- `sketch_energy_tolerance`: maximum relative L2 norm of the latest parameter
+  update omitted by a backward-error sketch; `0.1` means that the sketch must
+  retain at least 99% of its squared L2 energy.
+- `sketch_condition_limit`: maximum condition estimate accepted for the
+  sketched least-squares matrix.
+- `sketch_successes_before_shrink`: immediate successes required before the
+  backward-error controller probes a smaller fraction on a future cycle.
 
 Sketching reduces the tall least-squares work while the final extrapolation
 still uses the complete parameter history. Adaptive retries require a closure:
@@ -156,6 +167,16 @@ without a loss safeguard there is no rejection signal, so `"adaptive"` makes
 only the initial sketched attempt. Ordered stratified samples avoid the
 full-size permutation and reduce non-contiguous memory access, but the best
 fraction remains model- and hardware-dependent.
+
+The backward-error policy remembers the fraction that last passed its
+algebraic and loss checks. Rejections move the remembered starting point up;
+after several first-attempt successes, hysteresis lowers it by one growth step.
+This is a practical surrogate for the papers' exact stability bound: it uses
+the available optimizer update as the residual proxy and the condition of the
+small factor already formed by the Anderson kernel. A running local Lipschitz
+estimate, `max(||delta update|| / ||previous update||)`, tightens the energy
+limit when the observed optimizer map is more sensitive. History resets also
+reset the remembered fraction, success streak, and Lipschitz estimate.
 
 The closure should guard backward work with `torch.is_grad_enabled()` as in
 the example. The optimizer invokes it with gradients enabled for its ordinary

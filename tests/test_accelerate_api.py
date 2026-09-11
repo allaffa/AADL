@@ -16,7 +16,13 @@ from types import SimpleNamespace
 import torch
 
 from AADL import accelerate, remove_acceleration, reset_acceleration_history
-from AADL.accelerate import _sketch_fractions, _stratified_sketch_indices
+from AADL.accelerate import (
+    _discarded_energy_ratio,
+    _local_lipschitz_estimate,
+    _record_backward_error_result,
+    _sketch_fractions,
+    _stratified_sketch_indices,
+)
 
 
 def _free_port():
@@ -122,6 +128,36 @@ class TestAccelerateAPI(unittest.TestCase):
         self.assertGreaterEqual(int(first.min()), 0)
         self.assertLess(int(first.max()), 100)
         self.assertIsNone(_stratified_sketch_indices(100, 100, "cpu", seed=42))
+
+    def test_discarded_energy_ratio(self):
+        # Latest update is [3, 4, 0], so retaining the first coordinate omits
+        # norm 4 from a total norm 5.
+        X = torch.tensor([[0.0, 3.0], [0.0, 4.0], [0.0, 0.0]])
+        rows = torch.tensor([0], dtype=torch.long)
+        self.assertAlmostEqual(_discarded_energy_ratio(X, rows), 0.8)
+        self.assertEqual(_discarded_energy_ratio(X, None), 0.0)
+
+    def test_local_lipschitz_estimate_uses_update_differences(self):
+        # Updates are [1, 2, 4], so delta updates are [1, 2] and the ratios
+        # against preceding updates are both exactly one.
+        X = torch.tensor([[0.0, 1.0, 3.0, 7.0]])
+        self.assertAlmostEqual(_local_lipschitz_estimate(X), 1.0)
+
+    def test_backward_error_hysteresis_shrinks_after_success_streak(self):
+        state = SimpleNamespace(
+            acc_sketch_policy="backward_error",
+            acc_current_sketch_fraction=0.8,
+            acc_sketch_fraction=0.1,
+            acc_sketch_growth_factor=2.0,
+            acc_sketch_success_streak=0,
+            acc_sketch_successes_before_shrink=3,
+        )
+        for _ in range(3):
+            _record_backward_error_result(
+                state, state.acc_current_sketch_fraction, True, True,
+            )
+        self.assertAlmostEqual(state.acc_current_sketch_fraction, 0.4)
+        self.assertEqual(state.acc_sketch_success_streak, 0)
 
     def test_acceleration_speedup(self):
         target_loss = 1e-4
@@ -353,6 +389,10 @@ class TestAccelerateAPI(unittest.TestCase):
             {"sketch_fraction": 0.8, "sketch_max_fraction": 0.5},
             {"sketch_policy": "unknown"}, {"sketch_growth_factor": 1.0},
             {"sketch_seed": -1}, {"sketch_seed": True},
+            {"sketch_energy_tolerance": -0.1},
+            {"sketch_energy_tolerance": 1.1},
+            {"sketch_condition_limit": 0.9},
+            {"sketch_successes_before_shrink": 0},
         )
         for kwargs in invalid:
             opt = torch.optim.SGD(self._fresh_model().parameters(), lr=1e-2)
@@ -386,6 +426,9 @@ class TestAccelerateAPI(unittest.TestCase):
         reset_acceleration_history(opt)
         self.assertEqual(opt.acc_param_hist[0]["count"], 0)
         self.assertIsNone(opt.acc_param_hist[0]["buf"])
+        self.assertEqual(opt.acc_current_sketch_fraction, opt.acc_sketch_fraction)
+        self.assertEqual(opt.acc_sketch_success_streak, 0)
+        self.assertEqual(opt.acc_lipschitz_estimate, 0.0)
 
     def test_multigroup_safeguard_is_atomic(self):
         import AADL.anderson_acceleration as anderson_mod
@@ -511,6 +554,91 @@ class TestAccelerateAPI(unittest.TestCase):
 
         self.assertEqual(attempted_rows, [2, 4, 8, 10])
         self.assertTrue(torch.allclose(parameter.detach(), plain))
+        self.assertEqual(opt.acc_last_sketch_fraction, 0.5)
+
+    def test_backward_error_policy_grows_until_energy_is_retained(self):
+        import AADL.anderson_acceleration as anderson_mod
+
+        parameter = torch.nn.Parameter(torch.full((8,), 2.0))
+        opt = torch.optim.SGD([parameter], lr=0.1)
+        accelerate(
+            opt, acceleration_type="anderson", wait_iterations=0,
+            history_depth=4, frequency=1, sketch_fraction=0.25,
+            sketch_policy="backward_error", sketch_growth_factor=2.0,
+            sketch_max_fraction=1.0, sketch_energy_tolerance=0.8,
+        )
+
+        def closure():
+            loss = parameter.square().sum()
+            if torch.is_grad_enabled():
+                opt.zero_grad()
+                loss.backward()
+            return loss
+
+        opt.step(closure)
+        opt.step(closure)
+        solved_rows = []
+
+        def _candidate(Xhist, *args, row_indices=None,
+                       return_diagnostics=False, **kwargs):
+            solved_rows.append(Xhist.size(0) if row_indices is None
+                               else row_indices.numel())
+            result = torch.zeros_like(Xhist[:, -1])
+            return result, {"condition": 1.0}
+
+        original = anderson_mod.get_acceleration
+        anderson_mod.get_acceleration = lambda acc_type: _candidate
+        try:
+            opt.step(closure)
+        finally:
+            anderson_mod.get_acceleration = original
+
+        # The 25% sketch omits sqrt(3/4) energy and is skipped. The 50%
+        # sketch satisfies the 0.8 tolerance and is solved/accepted.
+        self.assertEqual(solved_rows, [4])
+        self.assertEqual(opt.acc_last_sketch_fraction, 0.5)
+        self.assertEqual(opt.acc_current_sketch_fraction, 0.5)
+
+    def test_backward_error_policy_retries_bad_condition(self):
+        import AADL.anderson_acceleration as anderson_mod
+
+        parameter = torch.nn.Parameter(torch.full((8,), 2.0))
+        opt = torch.optim.SGD([parameter], lr=0.1)
+        accelerate(
+            opt, acceleration_type="anderson", wait_iterations=0,
+            history_depth=4, frequency=1, sketch_fraction=0.25,
+            sketch_policy="backward_error", sketch_growth_factor=2.0,
+            sketch_max_fraction=1.0, sketch_energy_tolerance=1.0,
+            sketch_condition_limit=10.0,
+        )
+
+        def closure():
+            loss = parameter.square().sum()
+            if torch.is_grad_enabled():
+                opt.zero_grad()
+                loss.backward()
+            return loss
+
+        opt.step(closure)
+        opt.step(closure)
+        solved_rows = []
+
+        def _candidate(Xhist, *args, row_indices=None,
+                       return_diagnostics=False, **kwargs):
+            count = Xhist.size(0) if row_indices is None else row_indices.numel()
+            solved_rows.append(count)
+            condition = 100.0 if len(solved_rows) == 1 else 2.0
+            result = torch.zeros_like(Xhist[:, -1])
+            return result, {"condition": condition}
+
+        original = anderson_mod.get_acceleration
+        anderson_mod.get_acceleration = lambda acc_type: _candidate
+        try:
+            opt.step(closure)
+        finally:
+            anderson_mod.get_acceleration = original
+
+        self.assertEqual(solved_rows, [2, 4])
         self.assertEqual(opt.acc_last_sketch_fraction, 0.5)
 
     def test_safeguard_closures_are_loss_only(self):

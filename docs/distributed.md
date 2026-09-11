@@ -23,9 +23,10 @@ AADL owns:
 Coordinate sketching remains rank-local, just like each rank's Anderson
 history and coefficients. At a model-averaging boundary, the existing vote or
 sample-weighted mean-loss policy evaluates the resulting globally averaged
-candidate. Configure a fixed sketch with `safeguard=False` for this mode;
-adaptive sketch retries currently use the local closure safeguard and are not
-replayed after a global boundary rejection.
+candidate. With `safeguard=False`, `backward_error` can still enlarge sketches
+using its local algebraic indicators; loss-driven adaptive retries are not
+replayed after a global boundary rejection. Native model averaging resets the
+remembered sketch fraction and stability state along with Anderson history.
 
 ## Execution sequence
 

@@ -85,9 +85,13 @@ def _sketch_rows(self, X, fraction, group_index, attempt):
 
 def _sketch_fractions(self, can_retry):
     """Yield the initial sketch and any progressively more accurate retries."""
-    fraction = self.acc_sketch_fraction
+    fraction = (self.acc_current_sketch_fraction
+                if self.acc_sketch_policy == "backward_error"
+                else self.acc_sketch_fraction)
     yield fraction
-    if self.acc_sketch_policy != "adaptive" or not can_retry:
+    quality_can_retry = self.acc_sketch_policy == "backward_error"
+    if ((self.acc_sketch_policy != "adaptive" or not can_retry)
+            and not quality_can_retry):
         return
     while fraction < self.acc_sketch_max_fraction:
         fraction = min(
@@ -95,6 +99,52 @@ def _sketch_fractions(self, can_retry):
             fraction * self.acc_sketch_growth_factor,
         )
         yield fraction
+
+
+def _discarded_energy_ratio(X, row_indices):
+    """Relative L2 energy omitted from the latest update (the LS RHS)."""
+    if row_indices is None:
+        return 0.0
+    b = X[:, -1] - X[:, -2]
+    total_sq = torch.dot(b, b)
+    if not torch.isfinite(total_sq) or float(total_sq) == 0.0:
+        return 0.0
+    kept = b.index_select(0, row_indices)
+    kept_sq = torch.dot(kept, kept).clamp(max=total_sq)
+    omitted = ((total_sq - kept_sq) / total_sq).clamp(min=0.0)
+    return float(torch.sqrt(omitted))
+
+
+def _local_lipschitz_estimate(X):
+    """Estimate max ||delta f|| / ||delta x|| with optimizer steps as f."""
+    DX = X[:, 1:] - X[:, :-1]
+    if DX.size(1) < 2:
+        return 0.0
+    DR = DX[:, 1:] - DX[:, :-1]
+    denominators = DX[:, :-1].norm(dim=0)
+    valid = denominators > torch.finfo(X.dtype).eps
+    if not bool(valid.any()):
+        return 0.0
+    ratios = DR[:, valid].norm(dim=0) / denominators[valid]
+    finite = ratios[torch.isfinite(ratios)]
+    return float(finite.max()) if finite.numel() else float("inf")
+
+
+def _record_backward_error_result(self, fraction, accepted, first_attempt):
+    """Persist a stable starting fraction and cautiously relax after success."""
+    if self.acc_sketch_policy != "backward_error":
+        return
+    self.acc_current_sketch_fraction = fraction
+    if not accepted or not first_attempt:
+        self.acc_sketch_success_streak = 0
+        return
+    self.acc_sketch_success_streak += 1
+    if self.acc_sketch_success_streak >= self.acc_sketch_successes_before_shrink:
+        self.acc_current_sketch_fraction = max(
+            self.acc_sketch_fraction,
+            fraction / self.acc_sketch_growth_factor,
+        )
+        self.acc_sketch_success_streak = 0
 
 
 def _store_current_params(self):
@@ -223,18 +273,42 @@ def _unified_step(self, closure=None):
     for attempt, fraction in enumerate(
             _sketch_fractions(self, safeguard_closure is not None)):
         candidates = []
+        algebraically_acceptable = True
         for group_index, (group, state, X) in enumerate(histories):
             row_indices = _sketch_rows(
                 self, X, fraction, group_index, attempt,
             )
-            acc_param = accel_fn(
+            if self.acc_sketch_policy == "backward_error":
+                self.acc_lipschitz_estimate = max(
+                    self.acc_lipschitz_estimate,
+                    _local_lipschitz_estimate(X),
+                )
+                energy_limit = self.acc_sketch_energy_tolerance / max(
+                    1.0, self.acc_lipschitz_estimate,
+                )
+                if _discarded_energy_ratio(X, row_indices) > energy_limit:
+                    algebraically_acceptable = False
+                    break
+            result = accel_fn(
                 X, self.acc_relaxation, self.acc_reg, self.acc_dtype,
                 equilibrate=self.acc_equilibrate,
                 filter_condition=self.acc_filter_condition,
                 refinement_steps=self.acc_refinement_steps,
                 row_indices=row_indices,
+                return_diagnostics=(self.acc_sketch_policy == "backward_error"),
             )
+            if self.acc_sketch_policy == "backward_error":
+                acc_param, diagnostics = result
+                if diagnostics["condition"] > self.acc_sketch_condition_limit:
+                    algebraically_acceptable = False
+                    break
+            else:
+                acc_param = result
             candidates.append((group, state, acc_param))
+
+        self.acc_last_sketch_fraction = fraction
+        if not algebraically_acceptable:
+            continue
 
         # Apply every group before evaluating the candidate. Acceptance is an
         # optimizer-wide transaction, independent of parameter-group ordering.
@@ -244,18 +318,23 @@ def _unified_step(self, closure=None):
         accepted, acc_loss = _safeguard_accept(
             self, safeguard_closure, base_loss,
         )
-        self.acc_last_sketch_fraction = fraction
         if accepted:
             for _, state, acc_param in candidates:
                 _last_row(state, capacity).copy_(
                     acc_param.to(device=state['buf'].device)
                 )
+            _record_backward_error_result(
+                self, fraction, True, first_attempt=(attempt == 0),
+            )
             return acc_loss
 
         # Restore the unaccelerated iterate before constructing a retry.
         for group, state, _ in candidates:
             buffer_row_to_parameters_(_last_row(state, capacity), group['params'])
 
+    _record_backward_error_result(
+        self, self.acc_last_sketch_fraction, False, first_attempt=False,
+    )
     return base_loss
 
 
@@ -294,6 +373,9 @@ def accelerate(
     sketch_growth_factor: float = 2.0,
     sketch_max_fraction: float = 1.0,
     sketch_seed: int = 0,
+    sketch_energy_tolerance: float = 0.1,
+    sketch_condition_limit: float = 1e8,
+    sketch_successes_before_shrink: int = 3,
 ):
     """Wrap ``optimizer.step`` to apply Anderson-type acceleration.
 
@@ -351,14 +433,26 @@ def accelerate(
         Fraction of coordinates, sampled independently within each parameter
         group, used to estimate the mixing coefficients. The final candidate
         is always assembled from the full parameter history.
-    sketch_policy : {"fixed", "adaptive"}
+    sketch_policy : {"fixed", "adaptive", "backward_error"}
         ``adaptive`` retries a rejected safeguarded candidate with progressively
         more coordinates. Without a closure there is no rejection signal, so it
         behaves like ``fixed``.
+        ``backward_error`` grows the sketch until its discarded update energy
+        and least-squares condition estimate satisfy configured limits, then
+        uses the loss safeguard as the final acceptance test.
     sketch_growth_factor, sketch_max_fraction : float
         Multiplier and upper bound for adaptive retries.
     sketch_seed : int
         Non-negative seed for reproducible stratified coordinate samples.
+    sketch_energy_tolerance : float in [0, 1]
+        Maximum relative L2 norm of the latest update omitted by a
+        ``backward_error`` sketch.
+    sketch_condition_limit : float >= 1
+        Maximum accepted condition estimate of the sketched least-squares
+        matrix.
+    sketch_successes_before_shrink : int
+        Consecutive first-attempt successes required before trying a sketch
+        smaller by ``sketch_growth_factor`` on a future cycle.
     """
     if hasattr(optimizer, "acc_type"):
         raise ValueError(
@@ -412,8 +506,23 @@ def accelerate(
             or sketch_seed < 0):
         raise ValueError("sketch_seed must be a non-negative integer")
     if not isinstance(sketch_policy, str) or sketch_policy.lower() not in {
-            "fixed", "adaptive"}:
-        raise ValueError("sketch_policy must be 'fixed' or 'adaptive'")
+            "fixed", "adaptive", "backward_error"}:
+        raise ValueError(
+            "sketch_policy must be 'fixed', 'adaptive', or 'backward_error'"
+        )
+    if (not isinstance(sketch_energy_tolerance, (int, float))
+            or isinstance(sketch_energy_tolerance, bool)
+            or not math.isfinite(sketch_energy_tolerance)
+            or not 0.0 <= sketch_energy_tolerance <= 1.0):
+        raise ValueError("sketch_energy_tolerance must be in [0, 1]")
+    if (not isinstance(sketch_condition_limit, (int, float))
+            or isinstance(sketch_condition_limit, bool)
+            or not math.isfinite(sketch_condition_limit)
+            or sketch_condition_limit < 1.0):
+        raise ValueError("sketch_condition_limit must be at least 1")
+    _positive_int(
+        "sketch_successes_before_shrink", sketch_successes_before_shrink,
+    )
     # validate acceleration type early
     acc_type = acceleration_type.lower()
     if acc_type != "identity":
@@ -437,6 +546,12 @@ def accelerate(
     optimizer.acc_sketch_growth_factor = float(sketch_growth_factor)
     optimizer.acc_sketch_max_fraction = float(sketch_max_fraction)
     optimizer.acc_sketch_seed = sketch_seed
+    optimizer.acc_sketch_energy_tolerance = float(sketch_energy_tolerance)
+    optimizer.acc_sketch_condition_limit = float(sketch_condition_limit)
+    optimizer.acc_sketch_successes_before_shrink = sketch_successes_before_shrink
+    optimizer.acc_current_sketch_fraction = float(sketch_fraction)
+    optimizer.acc_sketch_success_streak = 0
+    optimizer.acc_lipschitz_estimate = 0.0
     optimizer.acc_last_sketch_fraction = None
     optimizer.acc_average_pre_step = average and acc_type != "identity"
 
@@ -474,6 +589,10 @@ _ACC_ATTRS = (
     "acc_safeguard",
     "acc_sketch_fraction", "acc_sketch_policy", "acc_sketch_growth_factor",
     "acc_sketch_max_fraction", "acc_sketch_seed",
+    "acc_sketch_energy_tolerance", "acc_sketch_condition_limit",
+    "acc_sketch_successes_before_shrink", "acc_current_sketch_fraction",
+    "acc_sketch_success_streak",
+    "acc_lipschitz_estimate",
     "acc_last_sketch_fraction",
     "acc_average_pre_step",
     "acc_param_hist", "avg_param_hist",
@@ -498,6 +617,10 @@ def reset_acceleration_history(optimizer):
     for history in optimizer.avg_param_hist:
         history.clear()
     optimizer.acc_store_counter = 0
+    optimizer.acc_current_sketch_fraction = optimizer.acc_sketch_fraction
+    optimizer.acc_sketch_success_streak = 0
+    optimizer.acc_lipschitz_estimate = 0.0
+    optimizer.acc_last_sketch_fraction = None
     return optimizer
 
 
