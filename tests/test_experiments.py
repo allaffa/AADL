@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import random
 import tempfile
 import unittest
@@ -7,9 +8,10 @@ import numpy as np
 import torch
 
 from AADL.experiments import ExperimentConfig, create_workload, list_workloads
+from AADL.experiments.__main__ import _override
 from AADL.experiments.benchmarks import benchmark_anderson_kernel
 from AADL.experiments.runner import run_experiment
-from AADL.experiments.workloads._common import batches
+from AADL.experiments.workloads._common import batches, partition_indices
 
 
 class TestExperimentConfig(unittest.TestCase):
@@ -25,12 +27,29 @@ class TestExperimentConfig(unittest.TestCase):
         self.assertEqual(config.method.optimizer, "adam")
         self.assertEqual(config.to_dict()["execution"]["device"], "cpu")
 
+    def test_dotted_cli_override_parses_json_values(self):
+        data = {"method": {"name": "old"}}
+        _override(data, "method.name=new")
+        _override(data, "execution.distributed=true")
+        _override(data, "method.acceleration={}")
+        self.assertEqual(data["method"]["name"], "new")
+        self.assertTrue(data["execution"]["distributed"])
+        self.assertEqual(data["method"]["acceleration"], {})
+
     def test_invalid_optimizer_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsupported optimizer"):
             ExperimentConfig.from_dict({
                 "family": "controlled", "workload": "controlled.quadratic",
                 "method": {"optimizer": "made-up"},
             })
+
+    def test_all_checked_in_paper_configs_validate(self):
+        root = Path(__file__).resolve().parents[1]
+        paths = sorted((root / "examples" / "paper" / "configs").glob("*.json"))
+        self.assertGreaterEqual(len(paths), 9)
+        for path in paths:
+            with self.subTest(path=path.name):
+                ExperimentConfig.from_dict(json.loads(path.read_text()))
 
 
 class TestWorkloadRegistry(unittest.TestCase):
@@ -39,7 +58,10 @@ class TestWorkloadRegistry(unittest.TestCase):
             set(list_workloads()),
             {
                 "controlled.quadratic", "graph.synthetic",
-                "transformer.synthetic", "vision.synthetic",
+                "graph.ogbg-molhiv", "transformer.glue-sst2",
+                "transformer.synthetic", "transformer.wikitext103",
+                "vision.cifar10", "vision.cifar100", "vision.imagenet",
+                "vision.synthetic",
             },
         )
 
@@ -65,6 +87,18 @@ class TestWorkloadRegistry(unittest.TestCase):
         labels1 = torch.cat([batch[1] for batch in rank1])
         self.assertEqual(len(rank0), len(rank1))
         self.assertTrue(set(labels0.tolist()).isdisjoint(labels1.tolist()))
+
+    def test_dirichlet_partition_is_reproducible_disjoint_and_balanced(self):
+        labels = torch.arange(120).remainder(3)
+        shards = [
+            partition_indices(labels, rank, 3, 11, 0, "dirichlet", 0.3)
+            for rank in range(3)
+        ]
+        self.assertEqual(len({len(shard) for shard in shards}), 1)
+        self.assertEqual(shards[0].tolist(), partition_indices(
+            labels, 0, 3, 11, 0, "dirichlet", 0.3,
+        ).tolist())
+        self.assertEqual(len(set(shards[0].tolist()) & set(shards[1].tolist())), 0)
 
 
 class TestExperimentRunner(unittest.TestCase):
@@ -97,9 +131,10 @@ class TestExperimentRunner(unittest.TestCase):
                         "workload_options": {
                             "dimension": 8, "samples": 16, "batch_size": 4,
                         },
-                        "method": {
-                            "learning_rate": 0.01,
-                            "acceleration": acceleration,
+                    "method": {
+                        "learning_rate": 0.01,
+                        "scheduler": {"name": "step", "step_size": 1, "gamma": 0.5},
+                        "acceleration": acceleration,
                         },
                         "execution": {"device": "cpu"},
                         "output": {"directory": directory},
@@ -107,6 +142,7 @@ class TestExperimentRunner(unittest.TestCase):
                     record, path = run_experiment(config)
                     self.assertEqual(record["status"], "completed")
                     self.assertEqual(record["epochs"][0]["steps"], 4)
+                    self.assertEqual(record["epochs"][0]["learning_rates"], [0.01])
                     self.assertTrue(path.exists())
                     persisted = json.loads(path.read_text())
                     self.assertEqual(persisted["schema_version"], 1)

@@ -36,13 +36,78 @@ runner all-reduces only the detached loss scalar. This makes acceptance and
 adaptive retry counts identical across ranks without triggering another
 gradient synchronization or duplicating DDP logic.
 
-The built-in `*.synthetic` workloads are fast protocol checks. They represent
-the controlled, vision, graph, and transformer interfaces without downloads.
-Publication experiments should register real dataset workloads through
-`register_workload`; optional packages such as torchvision, fairchem-core, or
-HydraGNN should be imported inside their workload factory so the core AADL
-installation remains usable without them.
+The built-in `*.synthetic` workloads are fast protocol checks. Real-data
+adapters are provided for `vision.cifar10`, `vision.cifar100`,
+`vision.imagenet`, `transformer.wikitext103`, `transformer.glue-sst2`, and
+`graph.ogbg-molhiv`. Optional packages are imported only when their workload is
+selected, so the core AADL installation remains lightweight.
 
 Kernel-cost studies use
 `AADL.experiments.benchmarks.benchmark_anderson_kernel`, keeping numerical
 microbenchmarks separate from end-to-end convergence experiments.
+
+## Preparing real data
+
+Install the optional Python packages after the machine-specific PyTorch stack:
+
+```bash
+python -m pip install -r requirements-paper.txt
+```
+
+Download public datasets in a serial allocation before launching DDP. This
+avoids concurrent extraction into the same cache:
+
+```bash
+python examples/paper/scripts/prepare_data.py cifar10 data/cifar10
+python examples/paper/scripts/prepare_data.py cifar100 data/cifar100
+python examples/paper/scripts/prepare_data.py wikitext103 data/huggingface
+python examples/paper/scripts/prepare_data.py glue-sst2 data/huggingface
+python examples/paper/scripts/prepare_data.py ogbg-molhiv data/ogb
+```
+
+ImageNet is not downloaded. Arrange it as `ROOT/train/<class>/...` and
+`ROOT/val/<class>/...`, then validate it with:
+
+```bash
+python examples/paper/scripts/prepare_data.py imagenet /path/to/imagenet
+```
+
+Dataset roots can be overridden without editing committed configurations:
+
+```bash
+examples/paper/scripts/run_serial.sh examples/paper/configs/cifar10.json \
+  --set workload_options.root=/datasets/cifar10
+examples/paper/scripts/run_ddp.sh 4 examples/paper/configs/cifar10-noniid-ddp.json \
+  --set workload_options.root=/datasets/cifar10
+```
+
+`partition="iid"` deterministically shards shuffled samples. For
+classification datasets, `partition="dirichlet"` uses labels and
+`dirichlet_alpha` to create heterogeneous rank-local data while retaining an
+equal number of samples per rank so DDP executes matching collective counts.
+
+Use `run_comparison.sh` to generate plain optimizer, full Anderson, and
+adaptive-sketch records from the same seed and workload configuration. Every
+configuration includes a conventional learning-rate scheduler and records the
+actual learning rate each epoch.
+
+## Materials workflows
+
+HydraGNN and fairchem/UMA are intentionally delegated to their native data and
+training tools because they own graph construction, force/energy losses, and
+HPC communication. After installing them with the machine-specific scripts:
+
+```bash
+examples/paper/scripts/run_hydragnn.sh /path/to/hydragnn-config.json
+examples/paper/scripts/prepare_uma_data.sh TRAIN_DIR VALID_DIR OUTPUT_DIR omat e
+examples/paper/scripts/run_fairchem.sh /path/to/uma-finetune.yaml runner.device=cuda
+```
+
+These two scripts prepare native baselines; they do **not** silently claim to
+apply AADL. A publishable Anderson comparison requires wrapping the optimizer
+inside HydraGNN/fairchem's training construction point, which should be added
+as a dedicated integration after fixing the exact upstream versions and model
+configurations used by the study.
+
+For every dataset, record its upstream revision/version, checksum or snapshot,
+license, split, preprocessing, and any sample cap in the manuscript artifact.

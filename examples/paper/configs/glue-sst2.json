@@ -1,0 +1,17 @@
+{
+  "family": "transformer",
+  "workload": "transformer.glue-sst2",
+  "seed": 7,
+  "epochs": 10,
+  "workload_options": {"root": "data/huggingface", "batch_size": 32, "sequence_length": 128, "max_train_samples": 67349, "max_eval_samples": 872, "model_name": "distilbert-base-uncased", "offline": false},
+  "method": {
+    "name": "anderson-adaptive",
+    "optimizer": "adamw",
+    "learning_rate": 0.0003,
+    "optimizer_options": {"weight_decay": 0.01},
+    "scheduler": {"name": "cosine", "eta_min": 0.00001},
+    "acceleration": {"acceleration_type": "anderson", "wait_iterations": 50, "history_depth": 8, "frequency": 25, "reg_acc": 1e-6, "sketch_fraction": 0.02, "sketch_policy": "backward_error"}
+  },
+  "output": {"directory": "results/glue-sst2", "save_trace": true},
+  "tags": {"dataset": "GLUE/SST-2", "study": "transformer-finetuning"}
+}

@@ -1,0 +1,18 @@
+{
+  "family": "vision",
+  "workload": "vision.cifar10",
+  "seed": 7,
+  "epochs": 200,
+  "workload_options": {"root": "data/cifar10", "batch_size": 128, "workers": 4, "download": false, "partition": "dirichlet", "dirichlet_alpha": 0.3, "max_eval_batches": 100},
+  "method": {
+    "name": "anderson-adaptive-noniid",
+    "optimizer": "sgd",
+    "learning_rate": 0.1,
+    "optimizer_options": {"momentum": 0.9, "weight_decay": 0.0005},
+    "scheduler": {"name": "cosine", "eta_min": 0.0001},
+    "acceleration": {"acceleration_type": "anderson", "wait_iterations": 100, "history_depth": 10, "frequency": 20, "reg_acc": 1e-7, "sketch_fraction": 0.05, "sketch_policy": "backward_error"}
+  },
+  "execution": {"device": "auto", "distributed": true},
+  "output": {"directory": "results/cifar10-noniid", "save_trace": true},
+  "tags": {"dataset": "CIFAR-10", "study": "non-IID-DDP", "dirichlet_alpha": "0.3"}
+}

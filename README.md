@@ -184,8 +184,10 @@ New research examples use the installable `AADL.experiments` framework instead
 of copying training loops between directories. Workload family, optimization
 method, serial/DDP execution, and result recording are independent settings.
 Built-in download-free workloads cover controlled, vision, graph, and
-transformer protocols, while a separate numerical-kernel benchmark measures
-the cost of the Anderson solve. Run a checked-in configuration with:
+transformer protocols. Optional real-data adapters cover CIFAR-10/100,
+ImageNet-1k, WikiText-103, GLUE/SST-2, and OGBG-MolHIV, while a separate
+numerical-kernel benchmark measures the cost of the Anderson solve. Run a
+checked-in configuration with:
 
 ```bash
 python -m AADL.experiments examples/paper/configs/controlled.json

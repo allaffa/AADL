@@ -38,6 +38,27 @@ def _optimizer(config, parameters):
     )
 
 
+def _scheduler(config, optimizer):
+    values = dict(config.method.scheduler)
+    name = values.pop("name", None)
+    if name is None:
+        if values:
+            raise ValueError("scheduler options require a scheduler name")
+        return None
+    choices = {
+        "cosine": torch.optim.lr_scheduler.CosineAnnealingLR,
+        "step": torch.optim.lr_scheduler.StepLR,
+        "multistep": torch.optim.lr_scheduler.MultiStepLR,
+    }
+    try:
+        scheduler = choices[name]
+    except KeyError as error:
+        raise ValueError(f"unsupported scheduler: {name}") from error
+    if name == "cosine":
+        values.setdefault("T_max", config.epochs)
+    return scheduler(optimizer, **values)
+
+
 def _controller_snapshot(optimizer, epoch, step):
     diagnostics = getattr(optimizer, "acc_sketch_last_diagnostics", None)
     if diagnostics is None:
@@ -76,6 +97,9 @@ def run_experiment(config: ExperimentConfig):
     optimizer = _optimizer(config, model.parameters())
     if config.method.acceleration:
         accelerate(optimizer, **config.method.acceleration)
+    # Construct after AADL installs its optimizer-step wrapper so PyTorch's
+    # scheduler observes the final step method and does not flag it as replaced.
+    scheduler = _scheduler(config, optimizer)
 
     record = new_record(config, context)
     global_step = 0
@@ -119,7 +143,10 @@ def run_experiment(config: ExperimentConfig):
                 "steps": len(losses),
                 "seconds": time.perf_counter() - epoch_started,
                 "metrics": metrics,
+                "learning_rates": [group["lr"] for group in optimizer.param_groups],
             })
+            if scheduler is not None:
+                scheduler.step()
         record["status"] = "completed"
         record["summary"] = record["epochs"][-1]["metrics"]
     except Exception as error:

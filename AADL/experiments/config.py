@@ -10,6 +10,7 @@ class MethodConfig:
     optimizer: str = "sgd"
     learning_rate: float = 1e-2
     optimizer_options: dict[str, Any] = field(default_factory=dict)
+    scheduler: dict[str, Any] = field(default_factory=dict)
     acceleration: dict[str, Any] = field(default_factory=dict)
 
     def validate(self):

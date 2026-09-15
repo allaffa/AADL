@@ -1,0 +1,17 @@
+{
+  "family": "vision",
+  "workload": "vision.cifar100",
+  "seed": 7,
+  "epochs": 200,
+  "workload_options": {"root": "data/cifar100", "batch_size": 128, "workers": 4, "download": false, "partition": "iid", "max_eval_batches": 100},
+  "method": {
+    "name": "anderson-adaptive",
+    "optimizer": "sgd",
+    "learning_rate": 0.1,
+    "optimizer_options": {"momentum": 0.9, "weight_decay": 0.0005},
+    "scheduler": {"name": "cosine", "eta_min": 0.0001},
+    "acceleration": {"acceleration_type": "anderson", "wait_iterations": 100, "history_depth": 10, "frequency": 20, "reg_acc": 1e-7, "sketch_fraction": 0.05, "sketch_policy": "backward_error"}
+  },
+  "output": {"directory": "results/cifar100", "save_trace": true},
+  "tags": {"dataset": "CIFAR-100", "study": "vision"}
+}
