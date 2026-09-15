@@ -1,0 +1,24 @@
+{
+  "family": "controlled",
+  "workload": "controlled.quadratic",
+  "seed": 7,
+  "epochs": 5,
+  "workload_options": {"dimension": 64, "samples": 256, "batch_size": 32},
+  "method": {
+    "name": "adaptive-anderson-ddp",
+    "optimizer": "sgd",
+    "learning_rate": 0.05,
+    "acceleration": {
+      "acceleration_type": "anderson",
+      "wait_iterations": 2,
+      "history_depth": 5,
+      "frequency": 2,
+      "reg_acc": 1e-7,
+      "sketch_fraction": 0.125,
+      "sketch_policy": "backward_error"
+    }
+  },
+  "execution": {"device": "auto", "distributed": true},
+  "output": {"directory": "results/controlled-ddp", "save_trace": true},
+  "tags": {"purpose": "distributed-consistency"}
+}

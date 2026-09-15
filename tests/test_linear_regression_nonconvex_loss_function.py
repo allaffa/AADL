@@ -204,6 +204,10 @@ def test_linear_regression_anderson(optimiser):
 
 @slow
 class TestLinearRegression(unittest.TestCase):
+    def setUp(self):
+        # The nonconvex objective has poor initial basins. Keep this convergence
+        # test independent of RNG use in tests that execute before it.
+        torch.manual_seed(0)
     
     def test_sgd(self):
         test_linear_regression('sgd')

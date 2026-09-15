@@ -178,6 +178,24 @@ See [Anderson sketching](docs/sketching.md) for the decision sequence,
 mathematical criteria, policy comparison, distributed semantics, and tuning
 guidance.
 
+## Reproducible experiment framework
+
+New research examples use the installable `AADL.experiments` framework instead
+of copying training loops between directories. Workload family, optimization
+method, serial/DDP execution, and result recording are independent settings.
+Built-in download-free workloads cover controlled, vision, graph, and
+transformer protocols, while a separate numerical-kernel benchmark measures
+the cost of the Anderson solve. Run a checked-in configuration with:
+
+```bash
+python -m AADL.experiments examples/paper/configs/controlled.json
+```
+
+See [Reproducible paper experiments](examples/paper/README.md) for the workload
+contract, native DDP launch, output schema, and guidance for real dataset
+plugins. Existing examples remain available as compatibility entry points and
+can migrate to this framework incrementally.
+
 The backward-error policy remembers the fraction that last passed its
 algebraic and loss checks. Rejections move the remembered starting point up;
 after several first-attempt successes, hysteresis lowers it by one growth step.
