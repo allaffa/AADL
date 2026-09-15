@@ -111,3 +111,22 @@ configurations used by the study.
 
 For every dataset, record its upstream revision/version, checksum or snapshot,
 license, split, preprocessing, and any sample cap in the manuscript artifact.
+
+## Aggregating repeated runs
+
+Point the aggregation script at one or more result directories. Metrics are
+dotted paths in the JSON record and may differ by workload:
+
+```bash
+python examples/paper/scripts/aggregate_results.py results/ \
+  --output paper-artifacts/cifar10 \
+  --metric accuracy=summary.accuracy \
+  --metric loss=summary.loss
+```
+
+The script recursively finds completed records, groups them by family,
+workload, and method, and calculates the mean, sample standard deviation, and a
+seeded 95% bootstrap confidence interval. It writes `summary.csv`, Markdown and
+booktabs-compatible LaTeX tables, an aggregation manifest, and PDF/PNG error-bar
+plots. Use `--group-by` repeatedly for a different grouping and `--no-plots`
+when only tables are needed.
