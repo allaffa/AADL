@@ -21,7 +21,9 @@ from AADL.accelerate import (
     _local_lipschitz_estimate,
     _record_backward_error_result,
     _sketch_fractions,
+    _sketch_rows,
     _stratified_sketch_indices,
+    _update_lipschitz_estimate,
 )
 
 
@@ -115,6 +117,11 @@ class TestAccelerateAPI(unittest.TestCase):
         config.acc_sketch_policy = "adaptive"
         self.assertEqual(list(_sketch_fractions(config, False)), [0.1])
 
+        config.acc_sketch_max_retries = 2
+        self.assertEqual(
+            list(_sketch_fractions(config, True)), [0.1, 0.2, 0.4],
+        )
+
     def test_stratified_sketch_is_reproducible_unique_and_ordered(self):
         first = _stratified_sketch_indices(100, 13, "cpu", seed=42)
         second = _stratified_sketch_indices(100, 13, "cpu", seed=42)
@@ -129,6 +136,21 @@ class TestAccelerateAPI(unittest.TestCase):
         self.assertLess(int(first.max()), 100)
         self.assertIsNone(_stratified_sketch_indices(100, 100, "cpu", seed=42))
 
+    def test_nested_sketch_strategies_retain_previous_rows(self):
+        X = torch.randn(32, 5)
+        for strategy in ("random_nested", "magnitude", "block"):
+            config = SimpleNamespace(
+                acc_sketch_seed=7,
+                acc_call_counter=3,
+                acc_sketch_strategy=strategy,
+            )
+            cache = {}
+            small = _sketch_rows(config, X, 0.25, 0, 0, cache)
+            large = _sketch_rows(config, X, 0.5, 0, 1, cache)
+            self.assertEqual(small.numel(), 8)
+            self.assertEqual(large.numel(), 16)
+            self.assertTrue(set(small.tolist()).issubset(set(large.tolist())))
+
     def test_discarded_energy_ratio(self):
         # Latest update is [3, 4, 0], so retaining the first coordinate omits
         # norm 4 from a total norm 5.
@@ -142,6 +164,17 @@ class TestAccelerateAPI(unittest.TestCase):
         # against preceding updates are both exactly one.
         X = torch.tensor([[0.0, 1.0, 3.0, 7.0]])
         self.assertAlmostEqual(_local_lipschitz_estimate(X), 1.0)
+
+    def test_lipschitz_ema_can_recover_from_old_large_observation(self):
+        state = SimpleNamespace(
+            acc_sketch_lipschitz_mode="ema",
+            acc_sketch_lipschitz_decay=0.5,
+            acc_lipschitz_estimate=10.0,
+        )
+        _update_lipschitz_estimate(state, 2.0)
+        self.assertAlmostEqual(state.acc_lipschitz_estimate, 6.0)
+        _update_lipschitz_estimate(state, 2.0)
+        self.assertAlmostEqual(state.acc_lipschitz_estimate, 4.0)
 
     def test_backward_error_hysteresis_shrinks_after_success_streak(self):
         state = SimpleNamespace(
@@ -393,6 +426,11 @@ class TestAccelerateAPI(unittest.TestCase):
             {"sketch_energy_tolerance": 1.1},
             {"sketch_condition_limit": 0.9},
             {"sketch_successes_before_shrink": 0},
+            {"sketch_strategy": "unknown"},
+            {"sketch_max_retries": -1}, {"sketch_max_retries": True},
+            {"sketch_lipschitz_mode": "unknown"},
+            {"sketch_lipschitz_decay": 1.0},
+            {"sketch_rescale": 1},
         )
         for kwargs in invalid:
             opt = torch.optim.SGD(self._fresh_model().parameters(), lr=1e-2)
@@ -673,6 +711,13 @@ class TestAccelerateAPI(unittest.TestCase):
         self.assertLess(float(returned_loss), plain_loss_before_acceleration)
         self.assertEqual(opt.acc_last_sketch_fraction, 0.25)
         self.assertEqual(opt.acc_current_sketch_fraction, 0.25)
+        diagnostics = opt.acc_sketch_last_diagnostics
+        self.assertTrue(diagnostics["accepted"])
+        self.assertEqual(diagnostics["attempts"][-1]["result"], "accepted")
+        group = diagnostics["attempts"][-1]["groups"][0]
+        self.assertEqual(group["rows"], 2)
+        self.assertIsNotNone(group["discarded_energy"])
+        self.assertIsNotNone(group["condition"])
 
     def test_safeguard_closures_are_loss_only(self):
         parameter = torch.nn.Parameter(torch.full((8,), 2.0))

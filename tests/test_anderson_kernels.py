@@ -19,6 +19,7 @@ from AADL.anderson_acceleration import (
     _compute_differences,
     _equilibrate_columns,
     _num_oldest_to_drop,
+    _sketched_system,
     anderson_normal_equation,
     anderson_qr_factorization,
     get_acceleration,
@@ -122,6 +123,16 @@ class AndersonKernelTests(unittest.TestCase):
         for rows in invalid:
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 anderson_qr_factorization(X, row_indices=rows)
+
+    def test_sketch_rescaling_applies_to_both_sides(self):
+        DR = torch.arange(12, dtype=torch.float64).reshape(4, 3)
+        b = torch.arange(4, dtype=torch.float64)
+        rows = torch.tensor([1, 3], dtype=torch.long)
+        DR_s, b_s = _sketched_system(DR, b, rows, row_scale=2.0)
+        self.assertTrue(torch.equal(DR_s, DR[rows] * 2.0))
+        self.assertTrue(torch.equal(b_s, b[rows] * 2.0))
+        with self.assertRaises(ValueError):
+            _sketched_system(DR, b, rows, row_scale=0.0)
 
     def test_relaxation_one_is_default(self):
         X = _richardson_history(self.A, self.b, self.x0, self.omega, n_iters=6)

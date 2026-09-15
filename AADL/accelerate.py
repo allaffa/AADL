@@ -69,18 +69,45 @@ def _stratified_sketch_indices(num_rows, requested_rows, device, seed):
     return indices.to(device=device)
 
 
-def _sketch_rows(self, X, fraction, group_index, attempt):
+def _sketch_rows(self, X, fraction, group_index, attempt, cache=None):
     num_rows = X.size(0)
     # A QR solve needs at least as many sampled rows as retained columns.
     min_rows = max(1, X.size(1) - 2)
     requested = max(min_rows, math.ceil(num_rows * fraction))
+    requested = min(requested, num_rows)
+    if requested >= num_rows:
+        return None
+    # The seed is intentionally independent of ``attempt`` for the nested
+    # strategies: increasing the requested size retains every previous row.
     seed = (self.acc_sketch_seed
             + 1_000_003 * self.acc_call_counter
-            + 10_007 * group_index
-            + 101 * attempt)
-    return _stratified_sketch_indices(
-        num_rows, min(requested, num_rows), X.device, seed,
-    )
+            + 10_007 * group_index)
+    strategy = self.acc_sketch_strategy
+    if strategy == "stratified":
+        # The low-memory default resamples strata as their widths change and is
+        # therefore not guaranteed to be nested.
+        return _stratified_sketch_indices(
+            num_rows, requested, X.device, seed + 101 * attempt,
+        )
+    if strategy == "random_nested":
+        key = (group_index, num_rows, seed, strategy)
+        rows = cache.get(key) if cache is not None else None
+        if rows is None:
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            rows = torch.randperm(num_rows, generator=generator)
+            if cache is not None:
+                cache[key] = rows
+        rows = rows[:requested]
+        return rows.sort().values.to(device=X.device)
+    if strategy == "magnitude":
+        b = (X[:, -1] - X[:, -2]).abs()
+        return torch.topk(b, requested, sorted=False).indices.sort().values
+    if strategy == "block":
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        start = int(torch.randint(num_rows, (1,), generator=generator))
+        rows = (torch.arange(requested) + start).remainder(num_rows)
+        return rows.sort().values.to(device=X.device)
+    raise RuntimeError(f"unhandled sketch strategy: {strategy}")
 
 
 def _sketch_fractions(self, can_retry):
@@ -93,11 +120,16 @@ def _sketch_fractions(self, can_retry):
     if ((self.acc_sketch_policy != "adaptive" or not can_retry)
             and not quality_can_retry):
         return
+    retries = 0
     while fraction < self.acc_sketch_max_fraction:
+        max_retries = getattr(self, "acc_sketch_max_retries", None)
+        if max_retries is not None and retries >= max_retries:
+            break
         fraction = min(
             self.acc_sketch_max_fraction,
             fraction * self.acc_sketch_growth_factor,
         )
+        retries += 1
         yield fraction
 
 
@@ -128,6 +160,20 @@ def _local_lipschitz_estimate(X):
     ratios = DR[:, valid].norm(dim=0) / denominators[valid]
     finite = ratios[torch.isfinite(ratios)]
     return float(finite.max()) if finite.numel() else float("inf")
+
+
+def _update_lipschitz_estimate(self, observation):
+    if self.acc_sketch_lipschitz_mode == "running_max":
+        self.acc_lipschitz_estimate = max(
+            self.acc_lipschitz_estimate, observation,
+        )
+    elif self.acc_lipschitz_estimate == 0.0:
+        self.acc_lipschitz_estimate = observation
+    else:
+        decay = self.acc_sketch_lipschitz_decay
+        self.acc_lipschitz_estimate = (
+            decay * self.acc_lipschitz_estimate + (1.0 - decay) * observation
+        )
 
 
 def _record_backward_error_result(self, fraction, accepted, first_attempt):
@@ -270,25 +316,50 @@ def _unified_step(self, closure=None):
     # Adaptive sketching uses the existing loss safeguard as an accuracy
     # controller. A rejected approximation is retried with more rows, up to the
     # configured maximum; the full plain step remains the transactional fallback.
+    trace = []
+    sketch_cache = {}
     for attempt, fraction in enumerate(
             _sketch_fractions(self, safeguard_closure is not None)):
+        attempt_trace = {"fraction": fraction, "groups": [], "result": None}
+        trace.append(attempt_trace)
         candidates = []
         algebraically_acceptable = True
         for group_index, (group, state, X) in enumerate(histories):
             row_indices = _sketch_rows(
-                self, X, fraction, group_index, attempt,
+                self, X, fraction, group_index, attempt, sketch_cache,
             )
             if self.acc_sketch_policy == "backward_error":
-                self.acc_lipschitz_estimate = max(
-                    self.acc_lipschitz_estimate,
-                    _local_lipschitz_estimate(X),
-                )
+                _update_lipschitz_estimate(self, _local_lipschitz_estimate(X))
                 energy_limit = self.acc_sketch_energy_tolerance / max(
                     1.0, self.acc_lipschitz_estimate,
                 )
-                if _discarded_energy_ratio(X, row_indices) > energy_limit:
+                energy = _discarded_energy_ratio(X, row_indices)
+                group_trace = {
+                    "group": group_index,
+                    "rows": X.size(0) if row_indices is None else row_indices.numel(),
+                    "total_rows": X.size(0),
+                    "discarded_energy": energy,
+                    "energy_limit": energy_limit,
+                    "condition": None,
+                }
+                attempt_trace["groups"].append(group_trace)
+                if energy > energy_limit:
                     algebraically_acceptable = False
+                    attempt_trace["result"] = "energy_rejected"
                     break
+            sampled_rows = X.size(0) if row_indices is None else row_indices.numel()
+            if self.acc_sketch_policy != "backward_error":
+                attempt_trace["groups"].append({
+                    "group": group_index,
+                    "rows": sampled_rows,
+                    "total_rows": X.size(0),
+                    "discarded_energy": None,
+                    "energy_limit": None,
+                    "condition": None,
+                })
+            row_scale = (math.sqrt(X.size(0) / sampled_rows)
+                         if self.acc_sketch_rescale and row_indices is not None
+                         else 1.0)
             result = accel_fn(
                 X, self.acc_relaxation, self.acc_reg, self.acc_dtype,
                 equilibrate=self.acc_equilibrate,
@@ -296,11 +367,14 @@ def _unified_step(self, closure=None):
                 refinement_steps=self.acc_refinement_steps,
                 row_indices=row_indices,
                 return_diagnostics=(self.acc_sketch_policy == "backward_error"),
+                row_scale=row_scale,
             )
             if self.acc_sketch_policy == "backward_error":
                 acc_param, diagnostics = result
+                group_trace["condition"] = diagnostics["condition"]
                 if diagnostics["condition"] > self.acc_sketch_condition_limit:
                     algebraically_acceptable = False
+                    attempt_trace["result"] = "condition_rejected"
                     break
             else:
                 acc_param = result
@@ -319,6 +393,7 @@ def _unified_step(self, closure=None):
             self, safeguard_closure, base_loss,
         )
         if accepted:
+            attempt_trace["result"] = "accepted"
             for _, state, acc_param in candidates:
                 _last_row(state, capacity).copy_(
                     acc_param.to(device=state['buf'].device)
@@ -326,12 +401,21 @@ def _unified_step(self, closure=None):
             _record_backward_error_result(
                 self, fraction, True, first_attempt=(attempt == 0),
             )
+            self.acc_sketch_last_diagnostics = {
+                "attempts": trace,
+                "accepted": True,
+            }
             return acc_loss
 
         # Restore the unaccelerated iterate before constructing a retry.
+        attempt_trace["result"] = "loss_rejected"
         for group, state, _ in candidates:
             buffer_row_to_parameters_(_last_row(state, capacity), group['params'])
 
+    self.acc_sketch_last_diagnostics = {
+        "attempts": trace,
+        "accepted": any(item["result"] == "accepted" for item in trace),
+    }
     _record_backward_error_result(
         self, self.acc_last_sketch_fraction, False, first_attempt=False,
     )
@@ -376,6 +460,11 @@ def accelerate(
     sketch_energy_tolerance: float = 0.1,
     sketch_condition_limit: float = 1e8,
     sketch_successes_before_shrink: int = 3,
+    sketch_strategy: str = "stratified",
+    sketch_max_retries=None,
+    sketch_lipschitz_mode: str = "running_max",
+    sketch_lipschitz_decay: float = 0.9,
+    sketch_rescale: bool = True,
 ):
     """Wrap ``optimizer.step`` to apply Anderson-type acceleration.
 
@@ -453,6 +542,19 @@ def accelerate(
     sketch_successes_before_shrink : int
         Consecutive first-attempt successes required before trying a sketch
         smaller by ``sketch_growth_factor`` on a future cycle.
+    sketch_strategy : {"stratified", "random_nested", "magnitude", "block"}
+        Coordinate-selection strategy. All but low-memory ``stratified`` keep
+        earlier rows when a sketch grows within an acceleration cycle.
+    sketch_max_retries : None | int
+        Maximum number of larger-sketch retries after the initial attempt.
+        ``None`` permits growth through ``sketch_max_fraction``.
+    sketch_lipschitz_mode : {"running_max", "ema"}
+        Aggregation used for local sensitivity observations.
+    sketch_lipschitz_decay : float in [0, 1)
+        Exponential decay used when ``sketch_lipschitz_mode="ema"``.
+    sketch_rescale : bool
+        Scale sampled rows by ``sqrt(total_rows / sampled_rows)`` so
+        regularization remains comparable across random sketch sizes.
     """
     if hasattr(optimizer, "acc_type"):
         raise ValueError(
@@ -523,6 +625,27 @@ def accelerate(
     _positive_int(
         "sketch_successes_before_shrink", sketch_successes_before_shrink,
     )
+    if not isinstance(sketch_strategy, str) or sketch_strategy.lower() not in {
+            "stratified", "random_nested", "magnitude", "block"}:
+        raise ValueError(
+            "sketch_strategy must be 'stratified', 'random_nested', "
+            "'magnitude', or 'block'"
+        )
+    if (sketch_max_retries is not None
+            and (isinstance(sketch_max_retries, bool)
+                 or not isinstance(sketch_max_retries, int)
+                 or sketch_max_retries < 0)):
+        raise ValueError("sketch_max_retries must be None or a non-negative integer")
+    if (not isinstance(sketch_lipschitz_mode, str)
+            or sketch_lipschitz_mode.lower() not in {"running_max", "ema"}):
+        raise ValueError("sketch_lipschitz_mode must be 'running_max' or 'ema'")
+    if (not isinstance(sketch_lipschitz_decay, (int, float))
+            or isinstance(sketch_lipschitz_decay, bool)
+            or not math.isfinite(sketch_lipschitz_decay)
+            or not 0.0 <= sketch_lipschitz_decay < 1.0):
+        raise ValueError("sketch_lipschitz_decay must be in [0, 1)")
+    if not isinstance(sketch_rescale, bool):
+        raise ValueError("sketch_rescale must be a boolean")
     # validate acceleration type early
     acc_type = acceleration_type.lower()
     if acc_type != "identity":
@@ -552,6 +675,12 @@ def accelerate(
     optimizer.acc_current_sketch_fraction = float(sketch_fraction)
     optimizer.acc_sketch_success_streak = 0
     optimizer.acc_lipschitz_estimate = 0.0
+    optimizer.acc_sketch_strategy = sketch_strategy.lower()
+    optimizer.acc_sketch_max_retries = sketch_max_retries
+    optimizer.acc_sketch_lipschitz_mode = sketch_lipschitz_mode.lower()
+    optimizer.acc_sketch_lipschitz_decay = float(sketch_lipschitz_decay)
+    optimizer.acc_sketch_rescale = sketch_rescale
+    optimizer.acc_sketch_last_diagnostics = None
     optimizer.acc_last_sketch_fraction = None
     optimizer.acc_average_pre_step = average and acc_type != "identity"
 
@@ -593,6 +722,9 @@ _ACC_ATTRS = (
     "acc_sketch_successes_before_shrink", "acc_current_sketch_fraction",
     "acc_sketch_success_streak",
     "acc_lipschitz_estimate",
+    "acc_sketch_strategy", "acc_sketch_max_retries",
+    "acc_sketch_lipschitz_mode", "acc_sketch_lipschitz_decay",
+    "acc_sketch_rescale", "acc_sketch_last_diagnostics",
     "acc_last_sketch_fraction",
     "acc_average_pre_step",
     "acc_param_hist", "avg_param_hist",
@@ -621,6 +753,7 @@ def reset_acceleration_history(optimizer):
     optimizer.acc_sketch_success_streak = 0
     optimizer.acc_lipschitz_estimate = 0.0
     optimizer.acc_last_sketch_fraction = None
+    optimizer.acc_sketch_last_diagnostics = None
     return optimizer
 
 

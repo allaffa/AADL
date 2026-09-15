@@ -38,13 +38,16 @@ def _compute_differences(X):
     return DX, DR
 
 
-def _sketched_system(DR, b, row_indices):
+def _sketched_system(DR, b, row_indices, row_scale=1.0):
     """Return the rows used to estimate the Anderson mixing coefficients.
 
     The full ``DR`` and ``b`` are deliberately retained by the caller for the
     final extrapolation.  Sketching therefore changes only the inexpensive
     mixing coefficients, never the dimensionality of the returned iterate.
     """
+    if (not isinstance(row_scale, (int, float)) or isinstance(row_scale, bool)
+            or not math.isfinite(row_scale) or row_scale <= 0.0):
+        raise ValueError("row_scale must be a positive finite number")
     if row_indices is None:
         return DR, b
     if (not isinstance(row_indices, torch.Tensor)
@@ -56,7 +59,8 @@ def _sketched_system(DR, b, row_indices):
     row_indices = row_indices.to(device=DR.device)
     if int(row_indices.min()) < 0 or int(row_indices.max()) >= DR.size(0):
         raise ValueError("row_indices contains an out-of-range row")
-    return DR.index_select(0, row_indices), b.index_select(0, row_indices)
+    return (DR.index_select(0, row_indices) * row_scale,
+            b.index_select(0, row_indices) * row_scale)
 
 
 def _apply_relaxation(extr, X, DX, gamma, relaxation):
@@ -168,7 +172,7 @@ def _anderson_extrapolate(X, DX, DR, b, gamma, n_drop, relaxation):
 def anderson_qr_factorization(X, relaxation=1.0, regularization=0.0, dtype=None,
                               equilibrate=True, filter_condition=0.0,
                               refinement_steps=0, row_indices=None,
-                              return_diagnostics=False):
+                              return_diagnostics=False, row_scale=1.0):
     # Anderson Acceleration
     # Take a matrix X of iterates such that X[:,i] = g(X[:,i-1])
     # Return acceleration for X[:,-1]
@@ -192,7 +196,7 @@ def anderson_qr_factorization(X, relaxation=1.0, regularization=0.0, dtype=None,
     b = DX[:, -1]
 
     # Matrix actually factorized (optionally in reduced precision).
-    DR_s, b_s = _sketched_system(DR, b, row_indices)
+    DR_s, b_s = _sketched_system(DR, b, row_indices, row_scale)
     DR_c = DR_s.to(compute_dtype) if downcast else DR_s
 
     # #4 Walker-Ni column filtering.
@@ -256,7 +260,7 @@ def anderson_qr_factorization(X, relaxation=1.0, regularization=0.0, dtype=None,
 def anderson_normal_equation(X, relaxation=1.0, regularization=0.0, dtype=None,
                              equilibrate=True, filter_condition=0.0,
                              refinement_steps=0, row_indices=None,
-                             return_diagnostics=False):
+                             return_diagnostics=False, row_scale=1.0):
     # Anderson Acceleration via the normal equations
     # Take a matrix X of iterates such that X[:,i] = g(X[:,i-1])
     # Return acceleration for X[:,-1]
@@ -274,7 +278,7 @@ def anderson_normal_equation(X, relaxation=1.0, regularization=0.0, dtype=None,
     DX, DR = _compute_differences(X)
     b = DX[:, -1]
 
-    DR_s, b_s = _sketched_system(DR, b, row_indices)
+    DR_s, b_s = _sketched_system(DR, b, row_indices, row_scale)
     DR_c = DR_s.to(compute_dtype) if downcast else DR_s
 
     # #4 Walker-Ni column filtering.

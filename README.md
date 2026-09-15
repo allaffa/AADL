@@ -160,6 +160,12 @@ loss = optimizer.step(closure)
   sketched least-squares matrix.
 - `sketch_successes_before_shrink`: immediate successes required before the
   backward-error controller probes a smaller fraction on a future cycle.
+- `sketch_strategy`: `"stratified"` (low-memory default), nested random,
+  residual-magnitude, or contiguous-block coordinate selection.
+- `sketch_max_retries`: optional compute budget for larger-sketch retries.
+- `sketch_lipschitz_mode`: conservative `"running_max"` or adaptive `"ema"`.
+- `sketch_rescale`: apply random-sketch scaling so regularization has a
+  comparable strength at different sketch sizes.
 
 Sketching reduces the tall least-squares work while the final extrapolation
 still uses the complete parameter history. Adaptive retries require a closure:
